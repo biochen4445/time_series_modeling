@@ -1,0 +1,296 @@
+---
+title: "COVID_NYC_MTA_Model"
+author: "Hung-Lin Chen"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapse: true
+      smooth_scroll: true
+---
+
+***How much has COVID cost the NYC Subway system in “lost fares”?***
+https://www.r-bloggers.com/2022/07/how-much-has-covid-cost-the-nyc-subway-system-in-lost-fares/
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, collapse = FALSE)
+
+library("knitr")
+
+library(tidyverse) #For Data Manipulation and Plotting
+library(janitor) #For cleaning up the variable names in the CSV Files
+library(lubridate) #For date processing 
+library(rvest) # For Web Scraping Links to Download
+
+### Data Manipulation Packages
+library(timetk)
+library(scales)
+
+# Modeling Ecosystem
+library(modeltime) 
+library(tidymodels) 
+# library(treesnip) 
+
+### Model Packages
+# library(catboost)
+library(prophet)
+
+```
+
+# Gathering the Data
+
+```{r eval=FALSE}
+all_weeks <- read_html("http://web.mta.info/developers/fare.html") %>%
+  html_nodes("a") %>% 
+  html_attr("href") %>% 
+  keep(str_detect(., 'fares_\\d{6}\\.csv')) %>% 
+  map_dfr(., function(x){
+    return(
+      read_csv(paste0("http://web.mta.info/developers/", x), skip = 2) %>% 
+        clean_names %>%
+        #Drop Dead Columns
+        select_if(~!all(is.na(.x))) %>%
+        mutate(
+          key = str_extract(x, '\\d+'),
+          
+          #The data in the files covers seven-day periods beginning on the Saturday 
+          #two weeks prior to the posting date and ending on the following Friday. 
+          #Thus, as an example, the file labeled Saturday, January 15, 2011, has data 
+          #covering the period from Saturday, January 1, 2011, through Friday, January 7. 
+          #The file labeled January 22 has data covering the period from 
+          #Saturday, January 8, through Friday, January 14. And so on and so forth
+          week_start = ymd(paste0('20',key)) - days(14),
+          week_end = ymd(paste0('20',key)) - days(8)
+        ) %>%
+        mutate(across(c(-remote, -station, -week_start, -week_end, -key), parse_number)) %>% 
+        pivot_longer(
+          cols = c(-remote, -station, -week_start, -week_end, -key),
+          names_to = "fare_type",
+          values_to = "fares"
+        )
+    )
+  }
+) 
+
+saveRDS(all_weeks,"mta_data.RDS")
+```
+
+### Input RDS
+```{r}
+dt <- readRDS('mta_data.RDS')  %>% 
+  group_by(week_start) %>% 
+  summarize(fares = sum(fares))
+```
+
+### Test plan
+
+```{r}
+dt %>% 
+  mutate(lbl = case_when(
+    week_start < ymd(20190101) ~ "a) Train",
+    year(week_start) == 2019 ~ 'b) Validate',
+    year(week_start) >= 2020 ~ 'c) Test'
+  ), 
+  total_fares = fares) %>% 
+  ggplot(aes(x = week_start)) + 
+  geom_line(data = dt, aes(y = fares), color = 'grey60') + 
+  geom_line(aes(y = fares, color = lbl)) + 
+  labs(title = 'Testing Plan for Forecasting',
+       x = "Date", y = "# of Metrocard Swipes",
+       color = "") + 
+  scale_y_continuous(labels = comma) + 
+  facet_wrap(~lbl, nrow = 3) + 
+  cowplot::theme_cowplot()
+
+```
+
+### Validation dataset
+```{r}
+test <- dt %>% filter(year(week_start) >= 2020)
+```
+
+### Training and testing dataset
+```{r}
+splits <- time_series_split(
+  dt %>% filter(year(week_start) < 2020) %>% arrange(week_start),
+  assess = 52, cumulative = T)
+```
+
+# Modeling
+
+### Pre-Preprocessing
+```{r}
+rec <- recipe(fares ~ ., data = training(splits)) %>%
+  update_role(week_start, new_role = 'id') %>% 
+  step_timeseries_signature(week_start) %>% 
+  step_rm(matches("(.iso$)|(am.pm$)|(.xts$)|(hour)|(minute)|(second)|(wday)")) %>% 
+  step_dummy(all_nominal(), one_hot = TRUE)
+```
+
+### Model Fitting
+```{r}
+# catboost_wf <- workflow() %>% 
+#   add_model(
+#     boost_tree(mode = 'regression') %>% 
+#       set_engine('catboost')
+#   ) %>% 
+#   add_recipe(rec) %>% 
+#   fit(training(splits))
+
+xgboost_wf <- workflow() %>% 
+  add_model(
+    boost_tree(mode = 'regression') %>% 
+      set_engine('xgboost')
+  ) %>% 
+  add_recipe(rec) %>% 
+  fit(training(splits))
+
+arima_boosted_wf <- workflow() %>% 
+  add_model(
+    arima_boost() %>%
+      set_engine(engine = "auto_arima_xgboost")
+  ) %>%
+  add_recipe(rec %>% update_role(week_start, new_role = "predictor")) %>%
+  fit(training(splits))
+
+
+ets_wf <- workflow() %>% 
+  add_model(
+    exp_smoothing() %>%
+      set_engine(engine = "ets")
+  ) %>%
+  add_recipe(rec %>% update_role(week_start, new_role = "predictor")) %>%
+  fit(training(splits))
+
+prophet_wf <- workflow() %>%
+  add_model(
+    prophet_reg(seasonality_yearly = TRUE) %>% 
+      set_engine(engine = 'prophet')
+  ) %>%
+  add_recipe(rec %>% update_role(week_start, new_role = "predictor")) %>%
+  fit(training(splits))
+
+prophet_boost_wf <- workflow() %>%
+  add_model(
+    prophet_boost(seasonality_yearly = TRUE) %>%
+      set_engine('prophet_xgboost')
+  ) %>% 
+  add_recipe(rec %>% update_role(week_start, new_role = "predictor")) %>%
+  fit(training(splits))
+```
+
+### Validating
+```{r}
+calibration_table <- modeltime_table(
+  #catboost_wf,
+  xgboost_wf,
+  arima_boosted_wf,
+  ets_wf,
+  prophet_wf,
+  prophet_boost_wf
+) %>% 
+  modeltime_calibrate(testing(splits))
+```
+
+### The accuracy metric
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  arrange(rmse) %>% 
+  select(.model_desc, where(is.double)) %>%
+  mutate(across(where(is.double), 
+                ~if_else(.x < 10, round(.x, 2), round(.x, 0)))) %>%
+  kable()
+```
+- From the accuracy table, the best model was the Prophet w/ XGBoosted Errors.
+
+### Visualize the the forecasted fit vs. the actuals in for the 2019 data.
+```{r}
+calibration_table %>% 
+    select(.model_desc, .calibration_data) %>% 
+    unnest(cols = c(.calibration_data)) %>% 
+    filter(year(week_start)==2019, .model_desc != 'ACTUAL') %>% 
+    ggplot(aes(x = week_start)) + 
+      geom_line(aes(y = .actual), color = 'black', lty = 2) + 
+      geom_line(aes(y = .prediction, color = .model_desc), lwd = 1.2) + 
+      facet_wrap(~.model_desc, ncol = 2) + 
+      scale_color_discrete(guide = "none") +
+      scale_y_continuous(label = comma) + 
+      labs(title = "Comparing Models to Test Set of 2009", 
+           subtitle = "Dashed Line is Actuals",
+           y = "# of Fares",
+           x = "Date") + 
+      theme_bw() + 
+      theme(
+        axis.text.x = element_text(angle = 60, hjust = .5, vjust = .5)
+      )
+```
+# Forecasting the COVID Time Period
+
+### Select model
+```{r}
+refit_tbl <- calibration_table %>% 
+    filter(.model_desc =='PROPHET W/ XGBOOST ERRORS' ) %>%
+    modeltime_refit(data = bind_rows(training(splits), testing(splits)))
+```
+
+### The forecasting
+```{r}
+final_fcst <- refit_tbl %>% 
+  modeltime_forecast(
+    new_data = test,
+    actual_data = dt,
+    keep_data = TRUE
+  )
+```
+
+## The forecast vs. the actuals can be visualized
+```{r}
+final_fcst %>% 
+  plot_modeltime_forecast(.conf_interval_show = T, .interactive = F) + 
+  scale_y_continuous(labels = comma)
+```
+
+# Calculating the “Lost Fare” Amount
+
+### Calculating
+```{r}
+loss_amt <- final_fcst %>% 
+  filter(.model_desc == 'PROPHET W/ XGBOOST ERRORS',
+         .index >= min(test$week_start)) %>% 
+  mutate(diff = fares-.value,
+         diff_lo = fares - .conf_lo,
+         diff_hi = fares - .conf_hi,
+         fare = diff * 2.00,
+         fare_lo = diff_lo * 2.00,
+         fare_high = diff_hi* 2.00) %>% 
+  arrange(.index) %>%
+  mutate(fares_lost = cumsum(fare),
+         fares_lost_lo = cumsum(fare_lo),
+         fares_lost_high = cumsum(fare_high)) 
+```
+
+### Visualized
+```{r}
+loss_amt %>% 
+  filter(.index >= ymd(20200101)) %>%
+  ggplot(aes(x = .index, y = fares_lost*-1)) + 
+    geom_line() + 
+    geom_ribbon(aes(ymin = fares_lost_lo*-1, ymax = fares_lost_high*-1), alpha = .3,
+                fill = 'darkgreen') + 
+    scale_y_continuous(labels = dollar, breaks = seq(0, 6e9, 1e9), expand = c(0 ,0)) + 
+    labs(title = "Cumulative Amount of Subway Fares Lost Since 2020",
+         x = "Date", y = "$ Lost", caption = "$ Lost = Projected Swipes Lost * $2.00") + 
+    cowplot::theme_cowplot() + 
+    theme(
+      plot.title.position = 'plot',
+      panel.grid.major.y = element_line(color = 'grey45')
+    )
+```
+
+# Conclusion
+Based on this forecasting exercise, its estimated that the MTA has already lost around $5B in “lost fares” and that number is continuing to grow.
