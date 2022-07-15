@@ -12,6 +12,7 @@ output:
 ---
 
 ***How much has COVID cost the NYC Subway system in “lost fares”?***
+Original website:
 https://www.r-bloggers.com/2022/07/how-much-has-covid-cost-the-nyc-subway-system-in-lost-fares/
 
 
